@@ -9,6 +9,7 @@
   const REFRESH_URL = BASE_URL + "/oauth/token"
   const CREDITS_URL = BASE_URL + "/aiserver.v1.DashboardService/GetCreditGrantsBalance"
   const REST_USAGE_URL = "https://cursor.com/api/usage"
+  const REST_USAGE_SUMMARY_URL = "https://cursor.com/api/usage-summary"
   const STRIPE_URL = "https://cursor.com/api/auth/stripe"
   const CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
   const REFRESH_BUFFER_MS = 5 * 60 * 1000 // refresh 5 minutes before expiration
@@ -139,7 +140,10 @@
     if (source === "keychain") {
       return writeKeychainValue(ctx, KEYCHAIN_ACCESS_TOKEN_SERVICE, accessToken)
     }
-    return writeStateValue(ctx, "cursorAuth/accessToken", accessToken)
+    if (source === "sqlite") {
+      return writeStateValue(ctx, "cursorAuth/accessToken", accessToken)
+    }
+    return false
   }
 
   function getTokenExpiration(ctx, token) {
@@ -275,6 +279,32 @@
     }
   }
 
+  function fetchUsageSummary(ctx, accessToken) {
+    var session = buildSessionToken(ctx, accessToken)
+    if (!session) {
+      ctx.host.log.warn("usage-summary: cannot build session token")
+      return null
+    }
+    try {
+      var resp = ctx.util.request({
+        method: "GET",
+        url: REST_USAGE_SUMMARY_URL,
+        headers: {
+          Cookie: "WorkosCursorSessionToken=" + session.sessionToken,
+        },
+        timeoutMs: 10000,
+      })
+      if (resp.status < 200 || resp.status >= 300) {
+        ctx.host.log.warn("usage-summary returned status=" + resp.status)
+        return null
+      }
+      return ctx.util.tryParseJson(resp.bodyText)
+    } catch (e) {
+      ctx.host.log.warn("usage-summary fetch failed: " + String(e))
+      return null
+    }
+  }
+
   function fetchStripeBalance(ctx, accessToken) {
     var session = buildSessionToken(ctx, accessToken)
     if (!session) {
@@ -326,7 +356,7 @@
           label: "Requests",
           used: used,
           limit: limit,
-          format: { kind: "count", suffix: "requests" },
+          format: { kind: "count", suffix: "/ " + limit + " requests" },
           resetsAt: ctx.util.toIso(cycleEndMs),
           periodDurationMs: billingPeriodMs,
         }))
@@ -374,6 +404,143 @@
     )
   }
 
+  function buildUsageSummaryResult(ctx, summary, accessToken) {
+    var lines = []
+    var plan = null
+
+    ctx.host.log.info("usage-summary: membershipType=" + summary.membershipType)
+
+    var looksLikeUsageSummary = !!(
+      summary.individualUsage ||
+      summary.teamUsage ||
+      summary.membershipType ||
+      summary.billingCycleStart ||
+      summary.billingCycleEnd
+    )
+    if (!looksLikeUsageSummary) {
+      ctx.host.log.warn("usage-summary: unsupported response shape")
+      return null
+    }
+
+    var billingPeriodMs = 30 * 24 * 60 * 60 * 1000
+    var cycleEnd = summary.billingCycleEnd ? ctx.util.parseDateMs(summary.billingCycleEnd) : null
+    var individualUsage = summary.individualUsage || {}
+    var teamUsage = summary.teamUsage || {}
+    var planUsage = individualUsage.plan || null
+    var overallUsage = individualUsage.overall || null
+    var pooledUsage = teamUsage.pooled || null
+
+    var requestUsage = fetchRequestBasedUsage(ctx, accessToken)
+    var requestsUsed = null
+    var requestsLimit = null
+
+    if (requestUsage && requestUsage["gpt-4"]) {
+      var gpt4 = requestUsage["gpt-4"]
+      requestsUsed = gpt4.numRequestsTotal || gpt4.numRequests || 0
+      requestsLimit = gpt4.maxRequestUsage || 0
+      ctx.host.log.info("usage-summary: found request usage: " + requestsUsed + "/" + requestsLimit)
+    }
+
+    if (requestsLimit && requestsLimit > 0) {
+      lines.push(ctx.line.progress({
+        label: "Requests",
+        used: requestsUsed,
+        limit: requestsLimit,
+        format: { kind: "count", suffix: "/ " + requestsLimit + " requests" },
+        resetsAt: ctx.util.toIso(cycleEnd),
+        periodDurationMs: billingPeriodMs
+      }))
+    } else {
+      var totalPercent = null
+
+      if (planUsage && typeof planUsage.totalPercentUsed === "number" && Number.isFinite(planUsage.totalPercentUsed)) {
+        totalPercent = planUsage.totalPercentUsed
+      } else if (
+        planUsage &&
+        typeof planUsage.autoPercentUsed === "number" &&
+        Number.isFinite(planUsage.autoPercentUsed) &&
+        typeof planUsage.apiPercentUsed === "number" &&
+        Number.isFinite(planUsage.apiPercentUsed)
+      ) {
+        totalPercent = (planUsage.autoPercentUsed + planUsage.apiPercentUsed) / 2
+      } else if (planUsage && typeof planUsage.apiPercentUsed === "number" && Number.isFinite(planUsage.apiPercentUsed)) {
+        totalPercent = planUsage.apiPercentUsed
+      } else if (planUsage && typeof planUsage.autoPercentUsed === "number" && Number.isFinite(planUsage.autoPercentUsed)) {
+        totalPercent = planUsage.autoPercentUsed
+      } else if (planUsage) {
+        var usedCents = planUsage.used || 0
+        var limitCents = planUsage.limit || 0
+        if (limitCents > 0) totalPercent = (usedCents / limitCents) * 100
+      } else if (overallUsage && overallUsage.limit > 0) {
+        totalPercent = ((overallUsage.used || 0) / overallUsage.limit) * 100
+      } else if (pooledUsage && pooledUsage.limit > 0) {
+        totalPercent = ((pooledUsage.used || 0) / pooledUsage.limit) * 100
+      }
+
+      if (typeof totalPercent === "number" && Number.isFinite(totalPercent)) {
+        totalPercent = Math.max(0, Math.min(100, Math.round(totalPercent * 100) / 100))
+        lines.push(ctx.line.progress({
+          label: "Total usage",
+          used: totalPercent,
+          limit: 100,
+          format: { kind: "percent" },
+          resetsAt: ctx.util.toIso(cycleEnd),
+          periodDurationMs: billingPeriodMs
+        }))
+      }
+    }
+
+    if (planUsage && typeof planUsage.autoPercentUsed === "number" && Number.isFinite(planUsage.autoPercentUsed)) {
+      var autoPercent = Math.round(planUsage.autoPercentUsed * 100) / 100
+      lines.push(ctx.line.progress({
+        label: "Auto usage",
+        used: autoPercent,
+        limit: 100,
+        format: { kind: "percent" },
+        resetsAt: ctx.util.toIso(cycleEnd),
+        periodDurationMs: billingPeriodMs
+      }))
+    }
+
+    if (planUsage && typeof planUsage.apiPercentUsed === "number" && Number.isFinite(planUsage.apiPercentUsed)) {
+      var apiPercent = Math.round(planUsage.apiPercentUsed * 100) / 100
+      lines.push(ctx.line.progress({
+        label: "API usage",
+        used: apiPercent,
+        limit: 100,
+        format: { kind: "percent" },
+        resetsAt: ctx.util.toIso(cycleEnd),
+        periodDurationMs: billingPeriodMs
+      }))
+    }
+
+    var onDemand = individualUsage.onDemand || teamUsage.onDemand
+    if (onDemand && onDemand.used && onDemand.used > 0) {
+      var onDemandUsed = ctx.fmt.dollars(onDemand.used)
+      var onDemandLimit = onDemand.limit ? ctx.fmt.dollars(onDemand.limit) : null
+      if (onDemandLimit) {
+        lines.push(ctx.line.progress({
+          label: "On-demand",
+          used: onDemandUsed,
+          limit: onDemandLimit,
+          format: { kind: "dollars" },
+        }))
+      }
+    }
+
+    // Plan name
+    if (summary.membershipType) {
+      plan = ctx.fmt.planLabel(summary.membershipType)
+    }
+
+    if (lines.length === 0) {
+      ctx.host.log.warn("usage-summary: no supported usage fields")
+      return null
+    }
+
+    return { plan: plan, lines: lines }
+  }
+
   function probe(ctx) {
     const authState = loadAuthState(ctx)
     let accessToken = authState.accessToken
@@ -389,7 +556,7 @@
 
     const nowMs = Date.now()
 
-    // Proactively refresh if token is expired or about to expire
+    // Proactively refresh if token is expired or about to expire.
     if (needsRefresh(ctx, accessToken, nowMs)) {
       ctx.host.log.info("token needs refresh (expired or expiring soon)")
       let refreshed = null
@@ -407,6 +574,18 @@
         throw "Not logged in. " + LOGIN_HINT
       }
     }
+
+    // Try usage-summary API first. It matches Cursor's dashboard fields better than Connect API.
+    ctx.host.log.info("attempting usage-summary API")
+    var usageSummary = fetchUsageSummary(ctx, accessToken)
+    if (usageSummary) {
+      var usageSummaryResult = buildUsageSummaryResult(ctx, usageSummary, accessToken)
+      if (usageSummaryResult) {
+        ctx.host.log.info("usage-summary API succeeded")
+        return usageSummaryResult
+      }
+    }
+    ctx.host.log.warn("usage-summary API failed or returned no data, falling back to Connect API")
 
     let usageResp
     let didRefresh = false
@@ -521,8 +700,15 @@
     }
 
     // Team plans may omit `enabled` even with valid plan usage data.
-    if (usage.enabled === false || !usage.planUsage) {
+    // Only throw if explicitly disabled AND no plan usage data
+    if (usage.enabled === false && !usage.planUsage) {
       throw "No active Cursor subscription."
+    }
+    
+    // If we have no plan usage at all, something is wrong
+    if (!usage.planUsage) {
+      ctx.host.log.error("no planUsage in response, enabled=" + usage.enabled)
+      throw "Usage data unavailable. Try again later."
     }
 
     let creditGrants = null
