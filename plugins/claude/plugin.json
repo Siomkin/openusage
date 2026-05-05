@@ -8,7 +8,7 @@
   "brandColor": "#DE7356",
   "links": [
     { "label": "Status", "url": "https://status.anthropic.com/" },
-    { "label": "Console", "url": "https://console.anthropic.com/" }
+    { "label": "Usage", "url": "https://claude.ai/settings/usage" }
   ],
   "lines": [
     { "type": "progress", "label": "Session", "scope": "overview", "primaryOrder": 1 },
